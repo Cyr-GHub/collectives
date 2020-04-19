@@ -7,13 +7,14 @@ from flask_wtf.file import FileField, FileAllowed
 from flask import current_app
 from flask_login import current_user
 from wtforms import SubmitField, SelectField, IntegerField, HiddenField
-from wtforms import FieldList, FormField, RadioField
+from wtforms import FieldList, BooleanField, FormField, RadioField, SelectMultipleField
 from wtforms_alchemy import ModelForm
 
 from ..models import Event, photos
 from ..models import Registration
 from ..models import ActivityType
 from ..models import User, Role, RoleIds, db
+from ..models.activitytype import leaders_without_activities
 
 
 def available_leaders(leaders, activity_ids):
@@ -75,7 +76,7 @@ def available_activities(activities, leaders, union):
             else:
                 choices &= leader.led_activities()
         # Always include existing activities
-        choices = list(choices | set(activities))
+        choices = list(choices | set(activities) if choices else activities)
 
     choices.sort(key=attrgetter("order", "name", "id"))
 
@@ -118,7 +119,8 @@ class EventForm(ModelForm, FlaskForm):
 
     photo_file = FileField(validators=[FileAllowed(photos, "Image only!")])
     duplicate_photo = HiddenField()
-    type = SelectField("Type", choices=[], coerce=int)
+    type = SelectField("Activité", choices=[], coerce=int)
+    types = SelectMultipleField("Activités", choices=[], coerce=int)
 
     add_leader = SelectField("Encadrant supplémentaire", choices=[], coerce=int)
     leader_actions = FieldList(FormField(LeaderActionForm, default=LeaderAction()))
@@ -129,12 +131,13 @@ class EventForm(ModelForm, FlaskForm):
     update_leaders = HiddenField()
     save_all = SubmitField("Enregistrer")
 
+    multi_activities_mode = BooleanField("Sortie multi-activités")
+
+    source_event = None
     current_leaders = []
     main_leader_fields = []
 
-    multi_activities_mode = False
-
-    def __init__(self, event, multi_activities_mode, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         """
         event is only used to populate activity/leader field choices.
         It is different from passing obj=event, which would populate all form fields
@@ -143,11 +146,19 @@ class EventForm(ModelForm, FlaskForm):
         super(EventForm, self).__init__(*args, **kwargs)
 
         if "obj" in kwargs:
-            self.type.data = int(kwargs["obj"].activity_types[0].id)
+            # Reading from an existing event
+            self.source_event = kwargs["obj"]
+            activities = self.source_event.activity_types
+            self.multi_activities_mode.data = len(activities) > 1 or any(
+                leaders_without_activities(activities, self.source_event.leaders)
+            )
+            self.type.data = int(activities[0].id)
+            self.types.data = [a.id for a in activities]
+            self.set_current_leaders(self.source_event.leaders)
+        else:
+            self.set_current_leaders([])
 
-        self.multi_activities_mode = multi_activities_mode
-        self.set_current_leaders(event.leaders)
-        self.update_choices(event)
+        self.update_choices()
 
     def set_current_leaders(self, leaders):
         """
@@ -160,30 +171,42 @@ class EventForm(ModelForm, FlaskForm):
         if not any(leaders):
             self.current_leaders.append(current_user)
 
-    def update_choices(self, event):
+    def update_choices(self):
         """
         Updates possible choices for activity and new leader select fields
         :param event: Event being currently edited
         :type event: :py:class:`collectives.modes.event.Event`
         """
         activity_ids = (
-            [] if self.multi_activities_mode or not self.type.data else [self.type.data]
+            []
+            if self.multi_activities_mode.data or not self.type.data
+            else [self.type.data]
         )
         leader_choices = available_leaders(self.current_leaders, activity_ids)
         self.add_leader.choices = [(0, "")]
         self.add_leader.choices += [(u.id, u.full_name()) for u in leader_choices]
 
-        activity_choices = available_activities(
-            event.activity_types, self.current_leaders, self.multi_activities_mode
+        source_activities = (
+            self.source_event.activity_types if self.source_event else []
         )
+        activity_choices = available_activities(
+            source_activities, self.current_leaders, self.multi_activities_mode.data
+        )
+
         self.type.choices = [(a.id, a.name) for a in activity_choices]
+        self.types.choices = [(a.id, a.name) for a in activity_choices]
+
+        if not self.type.data and self.types.data:
+            self.type.data = self.types.data[0]
+        if self.type.data and not self.types.data:
+            self.types.data = [self.type.data]
 
         self.main_leader_id.choices = []
         for l in self.current_leaders:
             self.main_leader_id.choices.append((l.id, "Responsable"))
 
         if self.main_leader_id.raw_data is None:
-            if event.main_leader_id is None:
+            if self.source_event is None or self.source_event.main_leader_id is None:
                 self.main_leader_id.default = self.current_leaders[0].id
                 self.main_leader_id.process([])
         self.main_leader_fields = list(self.main_leader_id)
@@ -214,6 +237,9 @@ class EventForm(ModelForm, FlaskForm):
         self.description.data = description.format(**columns)
 
     def current_activities(self):
+        if self.multi_activities_mode.data:
+            return ActivityType.query.filter(ActivityType.id.in_(self.types.data)).all()
+
         activity = ActivityType.query.get(self.type.data)
         return [] if activity is None else [activity]
 

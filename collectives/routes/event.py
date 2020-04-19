@@ -25,10 +25,14 @@ blueprint = Blueprint("event", __name__, url_prefix="/event")
 This blueprint contains all routes for avent display and management"""
 
 
-def accept_event_leaders(activities, leaders, multi_activity_mode):
+def validate_event_leaders(activities, leaders, multi_activity_mode):
     """
     Check whether all activities have a valid leader, display error if not the case
     """
+    if len(activities) == 0:
+        flash("Aucune activité définie", "error")
+        return False
+
     if current_user.is_moderator():
         return True
 
@@ -51,7 +55,7 @@ def accept_event_leaders(activities, leaders, multi_activity_mode):
             names = [a.name for a in problems]
             flash(
                 "Aucun encadrant valide n'a été défini pour les activités {}".format(
-                    names.join(", ")
+                    ", ".join(names)
                 )
             )
         return False
@@ -73,10 +77,69 @@ def accept_event_leaders(activities, leaders, multi_activity_mode):
     else:
         names = [u.full_name() for u in problems]
         flash(
-            "{} ne peuvent pas l'activité {}".format(
-                names.join(", "), activities[0].name
+            "{} ne peuvent pas encadrer l'activité {}".format(
+                ", ".join(names), activities[0].name
             )
         )
+    return False
+
+
+def validate_dates_and_slots(event):
+    valid = True
+    if not event.starts_before_ends():
+        flash("La date de début doit être antérieure à la date de fin")
+        valid = False
+    if event.num_online_slots > 0:
+        if not event.has_defined_registration_date():
+            flash(
+                "Les date de début ou fin d'ouverture ou de fermeture d'inscription ne peuvent être nulles."
+            )
+            valid = False
+        else:
+            if not event.opens_before_closes():
+                flash("Les inscriptions internet doivent ouvrir avant de terminer")
+                valid = False
+            if not event.closes_before_starts():
+                # May need to be relaxed for special events. See #159
+                flash(
+                    "Les inscriptions internet doivent se terminer avant le début de l'événement"
+                )
+                valid = False
+            elif not event.opens_before_ends():
+                flash(
+                    "Les inscriptions internet doivent ouvrir avant la fin de l'événement"
+                )
+                valid = False
+        if event.num_slots < event.num_online_slots:
+            flash(
+                "Le nombre de places internet ne doit pas dépasser le nombre de places total"
+            )
+            valid = False
+    elif event.num_online_slots < 0:
+        flash("Le nombre de places par internet ne peut être négatif")
+        valid = False
+    return valid
+
+
+def validate_all_leaders_are_useful(activities, leaders):
+    """
+    Check whether all leaders can lead at least one the of the activities,
+    and display an error message if this is not the case.
+    If the current user is a moderator, validation always succeed.
+    :return: whether all tests succeeded
+    :rtype: bool
+    """
+    if current_user.is_moderator():
+        return True
+
+    problems = leaders_without_activities(activities, leaders)
+    if len(problems) == 0:
+        return True
+    if len(problems) == 1:
+        flash("{} ne peut encadrer aucune activité.".format(problems[0].full_name()))
+    else:
+        names = [u.full_name() for u in problems]
+        flash("{} ne peuvent encadrer aucune activité.".format(", ".join(names)))
     return False
 
 
@@ -142,36 +205,33 @@ def print_event(event_id):
 @login_required
 @confidentiality_agreement()
 def manage_event(event_id=None):
-    multi_activities_mode = False
-
     if not current_user.can_create_events():
         flash("Accès restreint, rôle insuffisant.", "error")
         return redirect(url_for("event.index"))
 
     event = Event.query.get(event_id) if event_id is not None else Event()
-    form = EventForm(
-        event, multi_activities_mode, CombinedMultiDict((request.files, request.form))
-    )
+    form = EventForm(CombinedMultiDict((request.files, request.form)))
 
     if not form.is_submitted():
         if event_id is None:
-            form = EventForm(event, multi_activities_mode)
+            form = EventForm()
             form.set_default_description()
-        elif not form.is_submitted():
-            form = EventForm(event, multi_activities_mode, obj=event)
+        else:
+            form = EventForm(obj=event)
         form.setup_leader_actions()
         return render_template(
             "editevent.html", conf=current_app.config, event=event, form=form
         )
 
+    # Get current activites from form
+    tentative_activities = form.current_activities()
+
     # Fetch existing readers leaders minus removed ones
     previous_leaders = []
     tentative_leaders = []
     has_removed_leaders = False
-    seen_ids = set()
     for action in form.leader_actions:
         leader_id = int(action.data["leader_id"])
-        seen_ids.add(leader_id)
 
         leader = User.query.get(leader_id)
         if leader is None or not leader.can_create_events():
@@ -183,36 +243,18 @@ def manage_event(event_id=None):
             has_removed_leaders = True
         else:
             tentative_leaders.append(leader)
+       
+    # Set current leaders from submitted form
+    form.set_current_leaders(previous_leaders)
+    form.update_choices()
 
-    if event_id is None:
-        # Event is not created yet, get current leaders from submitted form
-        form.set_current_leaders(previous_leaders)
-        form.update_choices(event)
-    else:
-        # Protect ourselves against form data manipulation
-        # We should have a form entry for all existing leaders
-        for existing_leader in event.leaders:
-            if not existing_leader.id in seen_ids:
-                flash("Données incohérentes.", "error")
-                return redirect(url_for("event.index"))
-
-    # The 'Update activity' button has been clicked
+    # Update activities only
     # Do not process the remainder of the form
     if int(form.update_activity.data):
         # Check that the set of leaders is valid for current activities
-        tentative_activities = form.current_activities()
-        if accept_event_leaders(
-            tentative_activities, form.current_leaders, multi_activities_mode
-        ):
-            if not event_id is None:
-                event.activity_types = tentative_activities
-                db.session.add(event)
-                db.session.commit()
-        elif not event_id is None:
-            # Revert to previous event activity
-            form.type.data = event.current_activities[0].id
-            form.update_choices()
-
+        validate_event_leaders(
+            tentative_activities, previous_leaders, form.multi_activities_mode.data
+        )
         return render_template(
             "editevent.html", conf=current_app.config, event=event, form=form
         )
@@ -235,101 +277,88 @@ def manage_event(event_id=None):
             "editevent.html", conf=current_app.config, event=event, form=form
         )
 
-    has_changed_leaders = has_removed_leaders or new_leader_id > 0
-
-    # The 'Update leaders' button has been clicked
+    # Update leaders only
     # Do not process the remainder of the form
     if has_removed_leaders or int(form.update_leaders.data):
         # Check that the set of leaders is valid for current activities
-        if not has_changed_leaders or accept_event_leaders(
-            form.current_activities(), tentative_leaders, multi_activities_mode
+        if validate_event_leaders(
+            tentative_activities,
+            tentative_leaders,
+            form.multi_activities_mode.data,
         ):
             form.set_current_leaders(tentative_leaders)
-            form.update_choices(event)
+            form.update_choices()
             form.setup_leader_actions()
-            if not event_id is None:
-                event.leaders = tentative_leaders
-                db.session.add(event)
-                db.session.commit()
 
         return render_template(
             "editevent.html", conf=current_app.config, event=event, form=form
         )
+
+    # The 'Update event' button has been clicked
+    # Populate object, run custom validators
 
     if not form.validate():
         return render_template(
             "editevent.html", conf=current_app.config, event=event, form=form
         )
-
     form.populate_obj(event)
 
-    # The 'Update event button has been clicked'
-    # Custom validators
-    valid = True
-    if not event.starts_before_ends():
-        flash("La date de début doit être antérieure à la date de fin")
-        valid = False
-    if event.num_online_slots > 0:
-        if not event.has_defined_registration_date():
-            flash(
-                "Les date de début ou fin d'ouverture ou de fermeture d'inscription ne peuvent être nulles."
-            )
-            valid = False
-        else:
-            if not event.opens_before_closes():
-                flash("Les inscriptions internet doivent ouvrir avant de terminer")
-                valid = False
-            if not event.closes_before_starts():
-                # May need to be relaxed for special events. See #159
-                flash(
-                    "Les inscriptions internet doivent se terminer avant le début de l'événement"
-                )
-                valid = False
-            elif not event.opens_before_ends():
-                flash(
-                    "Les inscriptions internet doivent ouvrir avant la fin de l'événement"
-                )
-                valid = False
-        if event.num_slots < event.num_online_slots:
-            flash(
-                "Le nombre de places internet ne doit pas dépasser le nombre de places total"
-            )
-            valid = False
-    elif event.num_online_slots < 0:
-        flash("Le nombre de places par internet ne peut être négatif")
-        valid = False
-
-    if not valid:
+    if not validate_dates_and_slots(event):
         return render_template(
             "editevent.html", conf=current_app.config, event=event, form=form
         )
 
-    event.set_rendered_description(event.description)
+    has_new_activity = any(a not in event.activity_types for a in tentative_activities)
 
-    # For now enforce single activity type
-    activity_type = ActivityType.query.filter_by(id=event.type).first()
-    has_new_activity = activity_type not in event.activity_types
+    tentative_leaders_set = set(tentative_leaders)
+    existing_leaders_set = set(event.leaders)
+    has_changed_leaders = any(tentative_leaders_set ^ existing_leaders_set)
 
-    # We have changed activity or added/removed a leader
-    # Check that there is a valid leader
+    # We have added a new activity or added/removed leaders
+    # Check that the leaders are still valid
     if has_new_activity or has_changed_leaders:
-        if not accept_event_leaders(
-            form.current_activities(), tentative_leaders, multi_activities_mode
-        ):
+        valid = validate_event_leaders(
+            tentative_activities, tentative_leaders, form.multi_activities_mode.data,
+        )
+        if valid and form.multi_activities_mode.data:
+            valid = validate_all_leaders_are_useful(
+                tentative_activities, tentative_leaders
+            )
+
+        if not valid:
             return render_template(
                 "editevent.html", conf=current_app.config, event=event, form=form
             )
 
-    # Apply changes
-    if has_new_activity:
-        event.activity_types = form.current_activities()
+    # If event has not been created yet user current activities to check rights
+    if event_id is None:
+        event.activity_types = tentative_activities
+
+    # Check that we have not removed leaders that we don't have the right to
+    removed_leaders = existing_leaders_set - tentative_leaders_set
+    for removed_leader in removed_leaders:
+        if not event.can_remove_leader(current_user, removed_leader):
+            flash(
+                "Impossible de supprimer l'encadrant: {}".format(
+                    removed_leader.full_name()
+                ),
+                "error",
+            )
+            return render_template(
+                "editevent.html", conf=current_app.config, event=event, form=form
+            )
+
+    # All good! Apply changes
+    event.activity_types = tentative_activities
     event.leaders = tentative_leaders
+
+    event.set_rendered_description(event.description)
 
     # We have to save new event before add the photo, or id is not defined
     db.session.add(event)
     db.session.commit()
 
-    # If no photo is sen, we don't do anything, especially if a photo is
+    # If no photo is sent, we don't do anything, especially if a photo is
     # already existing
     if form.photo_file.data is not None:
         event.save_photo(form.photo_file.data)
@@ -353,8 +382,6 @@ def manage_event(event_id=None):
 @login_required
 @confidentiality_agreement()
 def duplicate(event_id=None):
-    multi_activities_mode = False
-
     if not current_user.can_create_events():
         flash("Accès restreint, rôle insuffisant.", "error")
         return redirect(url_for("event.index"))
@@ -365,7 +392,7 @@ def duplicate(event_id=None):
         flash("Pas d'évènement à dupliquer", "error")
         return redirect(url_for("event.index"))
 
-    form = EventForm(event, multi_activities_mode, obj=event)
+    form = EventForm(event, obj=event)
     form.setup_leader_actions()
     form.duplicate_photo.data = event_id
 

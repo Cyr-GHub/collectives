@@ -271,6 +271,7 @@ Bonjour {name},
 
 Pour confirmer la {reason} de votre compte sur le site 'Collectives' du CAF Annecy, veuillez vous rendre à l'adresse ci-dessous:
 {link}
+Ce lien expirera après {expiry_hours} heures.
 
 Ce mail est envoyé par un automate, répondre à ce mail sera sans effet.
 """

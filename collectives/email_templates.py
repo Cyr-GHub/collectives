@@ -5,7 +5,7 @@ from sys import stderr
 from flask import current_app, url_for
 
 from .utils import mail
-from .models.auth import ConfirmationTokenType
+from .models.auth import ConfirmationTokenType, TOKEN_DURATION
 from .models.user import activity_supervisors
 
 
@@ -53,6 +53,7 @@ def send_confirmation_email(email, name, token):
     message = current_app.config["CONFIRMATION_MESSAGE"].format(
         name=name,
         reason=reason,
+        expiry_hours=TOKEN_DURATION.seconds//3600,
         link=url_for(
             "auth.process_confirmation", token_uuid=token.uuid, _external=True
         ),
